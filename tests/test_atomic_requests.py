@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 from django.db import connection, connections, transaction
 from django.http import Http404
@@ -6,6 +7,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import path
 
 from rest_framework import status
+from rest_framework.deprecation import RemovedInDRF321Warning
 from rest_framework.exceptions import APIException
 from rest_framework.response import Response
 from rest_framework.test import APIRequestFactory
@@ -202,8 +204,9 @@ class SetRollbackTests(TestCase):
         connections.databases['default']['ATOMIC_REQUESTS'] = False
 
     def test_marks_initialized_atomic_connection_for_rollback(self):
+        request = factory.post('/')
         with transaction.atomic():
-            set_rollback()
+            set_rollback(request)
             assert transaction.get_rollback()
 
 
@@ -238,7 +241,8 @@ class SetRollbackUninitializedConnectionTests(UninitializedSecondaryConnectionMi
         super().tearDown()
 
     def test_does_not_initialize_unused_connections(self):
-        set_rollback()
+        request = factory.post('/')
+        set_rollback(request)
         assert not hasattr(connections._connections, 'secondary')
 
 
@@ -257,3 +261,71 @@ class MultiDBUnusedConnectionAPIExceptionTests(UninitializedSecondaryConnectionM
         response = self.view(request)
         assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
         assert not hasattr(connections._connections, 'secondary')
+
+
+@override_settings(ROOT_URLCONF='tests.test_atomic_requests')
+class NonAtomicViewUnderTestCaseTests(TestCase):
+    """
+    Regression test for #6921.
+
+    A view decorated with ``@transaction.non_atomic_requests`` must not
+    poison the outer transaction that Django's ``TestCase`` wraps each
+    test in. Before the fix, ``set_rollback`` would see
+    ``connection.in_atomic_block == True`` and mark the outer transaction
+    for rollback, breaking any subsequent queries in the test.
+    """
+    def setUp(self):
+        connections.databases['default']['ATOMIC_REQUESTS'] = True
+
+    def tearDown(self):
+        connections.databases['default']['ATOMIC_REQUESTS'] = False
+
+    def test_non_atomic_view_does_not_mark_outer_transaction_for_rollback(self):
+        # TestCase has already opened an atomic block around this test.
+        assert transaction.get_rollback() is False
+
+        # Sending the request through the test client populates
+        # ``request.resolver_match``, so ``set_rollback`` can see the
+        # view's ``_non_atomic_requests`` attribute and skip the database.
+        response = self.client.get('/')
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+        # The outer transaction must remain usable. Without the fix,
+        # ``set_rollback`` would have marked it for rollback and the
+        # following query would raise.
+        assert transaction.get_rollback() is False
+        BasicModel.objects.create()
+
+
+class SetRollbackDeprecationTests(TestCase):
+    """
+    Calling ``set_rollback()`` without a ``request`` argument should emit
+    a ``RemovedInDRF321Warning``.
+    """
+    def test_calling_without_request_emits_warning(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            set_rollback()
+        assert len(caught) == 1
+        assert issubclass(caught[0].category, RemovedInDRF321Warning)
+        assert "without a `request` argument is deprecated" in str(caught[0].message)
+
+
+class SetRollbackWithoutResolverMatchTests(TestCase):
+    """
+    ``APIRequestFactory`` produces requests without a ``resolver_match``.
+    ``set_rollback`` must fall back to the previous
+    ``ATOMIC_REQUESTS + in_atomic_block`` behavior in that case.
+    """
+    def setUp(self):
+        connections.databases['default']['ATOMIC_REQUESTS'] = True
+
+    def tearDown(self):
+        connections.databases['default']['ATOMIC_REQUESTS'] = False
+
+    def test_falls_back_when_resolver_match_missing(self):
+        request = factory.post('/')
+        assert getattr(request, 'resolver_match', None) is None
+        with transaction.atomic():
+            set_rollback(request)
+            assert transaction.get_rollback()
